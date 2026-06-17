@@ -1,116 +1,136 @@
 """
-financial.py
-------------
-100% real maths on the user's own assumptions. No external data.
-Outputs revenue scenarios, EBITDA, net profit, payback, ROI,
-break-even occupancy, max defensible purchase price, and a
-sensitivity grid (occupancy x daily fee).
+provenance.py
+-------------
+The backbone of the tool. NOTHING is displayed as a bare number.
+Every value is wrapped in a DataPoint that carries where it came from,
+when it was retrieved, how confident we are, and any warning.
+
+This is what stops the app from "pretending old data is current" or
+inventing numbers. If a value is illustrative it is tagged DEMO and
+renders with a red badge so it can never be mistaken for real data.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Optional
+
+
+class Confidence(str, Enum):
+    HIGH = "High"        # official source, fetched live or <24h cache
+    MEDIUM = "Medium"    # official but older, or derived
+    LOW = "Low"          # scraped / stale / heavily estimated
+    DEMO = "DEMO"        # NOT REAL — illustrative placeholder only
+    MISSING = "Missing"  # could not be obtained
+
+    @property
+    def colour(self) -> str:
+        return {
+            "High": "#1a7f37",
+            "Medium": "#9a6700",
+            "Low": "#bc4c00",
+            "DEMO": "#cf222e",
+            "Missing": "#57606a",
+        }[self.value]
+
+
+class Method(str, Enum):
+    API = "api"
+    DOWNLOAD = "download"   # official file download (e.g. ACECQA register)
+    SCRAPE = "scrape"       # third-party scrape (label loudly)
+    MANUAL = "manual"       # hand-entered reference fact
+    COMPUTED = "computed"   # derived from other DataPoints
+    DEMO = "demo"
 
 
 @dataclass
-class FinancialInputs:
-    licensed_places: int = 90
-    occupancy_pct: float = 85.0
-    avg_daily_fee: float = 145.0
-    days_open: int = 250
-    wage_pct: float = 55.0          # % of revenue
-    rent_pct: float = 12.0
-    food_pct: float = 4.0
-    other_pct: float = 9.0
-    purchase_price: float = 3_000_000.0
-    ebitda_multiple: float = 5.0
-    loan_amount: float = 2_000_000.0
-    interest_rate: float = 7.0       # annual %
-    target_roi_pct: float = 20.0     # used for max-price calc
+class Source:
+    name: str
+    url: str = ""
+    retrieved: Optional[str] = None      # ISO date the app pulled it
+    last_updated: Optional[str] = None   # publisher's "last updated", if known
+    method: Method = Method.MANUAL
 
-
-def _revenue(places: int, occ_pct: float, fee: float, days: int) -> float:
-    return places * (occ_pct / 100.0) * fee * days
-
-
-def _ebitda(revenue: float, i: FinancialInputs) -> float:
-    opex_pct = i.wage_pct + i.rent_pct + i.food_pct + i.other_pct
-    return revenue * (1 - opex_pct / 100.0)
+    @staticmethod
+    def now() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 @dataclass
-class FinancialResult:
-    revenue: float
-    revenue_scenarios: Dict[int, float]
-    ebitda: float
-    interest_cost: float
-    net_profit: float
-    ebitda_margin_pct: float
-    payback_years: float
-    roi_pct: float
-    breakeven_occupancy_pct: float
-    implied_value_at_multiple: float
-    max_price_for_target_roi: float
-    sensitivity: List[dict]
-    warnings: List[str] = field(default_factory=list)
+class DataPoint:
+    value: Any
+    source: Source
+    confidence: Confidence = Confidence.MEDIUM
+    unit: str = ""
+    warning: str = ""
+
+    @classmethod
+    def demo(cls, value: Any, label: str, unit: str = "") -> "DataPoint":
+        """Build a clearly-flagged illustrative value."""
+        return cls(
+            value=value,
+            source=Source(name=f"DEMO placeholder — {label}", method=Method.DEMO),
+            confidence=Confidence.DEMO,
+            unit=unit,
+            warning="NOT REAL DATA. Illustrative only. Replace by running the live connector.",
+        )
+
+    @classmethod
+    def missing(cls, label: str, how_to_get: str = "") -> "DataPoint":
+        return cls(
+            value=None,
+            source=Source(name=label, method=Method.MANUAL),
+            confidence=Confidence.MISSING,
+            warning=("Not loaded. " + how_to_get).strip(),
+        )
+
+    @property
+    def is_real(self) -> bool:
+        return self.confidence not in (Confidence.DEMO, Confidence.MISSING)
+
+    def display(self) -> str:
+        if self.value is None:
+            return "—"
+        if isinstance(self.value, float):
+            v = f"{self.value:,.1f}".rstrip("0").rstrip(".")
+        elif isinstance(self.value, int):
+            v = f"{self.value:,}"
+        else:
+            v = str(self.value)
+        return f"{v}{(' ' + self.unit) if self.unit else ''}"
 
 
-def run_model(i: FinancialInputs) -> FinancialResult:
-    rev = _revenue(i.licensed_places, i.occupancy_pct, i.avg_daily_fee, i.days_open)
-    scenarios = {
-        occ: _revenue(i.licensed_places, occ, i.avg_daily_fee, i.days_open)
-        for occ in (70, 80, 90, 95)
-    }
-    ebitda = _ebitda(rev, i)
-    interest = i.loan_amount * i.interest_rate / 100.0
-    net = ebitda - interest
-    margin = (ebitda / rev * 100.0) if rev else 0.0
-    payback = (i.purchase_price / ebitda) if ebitda > 0 else float("inf")
-    equity = max(i.purchase_price - i.loan_amount, 1.0)
-    roi = (net / equity * 100.0)
-
-    # Break-even occupancy: occupancy where EBITDA == interest cost
-    opex_pct = i.wage_pct + i.rent_pct + i.food_pct + i.other_pct
-    rev_per_occ_pt = i.licensed_places * 0.01 * i.avg_daily_fee * i.days_open  # revenue per 1% occ
-    contrib_per_occ_pt = rev_per_occ_pt * (1 - opex_pct / 100.0)
-    be_occ = (interest / contrib_per_occ_pt) if contrib_per_occ_pt > 0 else float("inf")
-
-    implied_value = ebitda * i.ebitda_multiple
-    # Max price such that net_profit / equity >= target_roi, assuming same loan
-    # net = ebitda - interest ; equity = price - loan ; roi = net/equity
-    # price <= loan + net/(target_roi/100)
-    max_price = (i.loan_amount + net / (i.target_roi_pct / 100.0)) if i.target_roi_pct > 0 else float("inf")
-
-    # Sensitivity grid: EBITDA across occupancy x fee
-    fees = [round(i.avg_daily_fee * m) for m in (0.9, 1.0, 1.1)]
-    occs = [70, 80, 90, 95]
-    grid = []
-    for occ in occs:
-        row = {"occupancy_%": occ}
-        for f in fees:
-            r = _revenue(i.licensed_places, occ, f, i.days_open)
-            row[f"${f}/day EBITDA"] = round(_ebitda(r, i))
-        grid.append(row)
-
-    warns = []
-    if opex_pct >= 100:
-        warns.append("Operating cost % sums to ≥100% — model will show losses; check inputs.")
-    if i.wage_pct < 45 or i.wage_pct > 70:
-        warns.append("Wage % outside the typical 45–70% LDC range — verify against payroll.")
-    if payback != float("inf") and payback > 12:
-        warns.append("Payback >12 years — return looks weak at this price.")
-
-    return FinancialResult(
-        revenue=round(rev), revenue_scenarios={k: round(v) for k, v in scenarios.items()},
-        ebitda=round(ebitda), interest_cost=round(interest), net_profit=round(net),
-        ebitda_margin_pct=round(margin, 1), payback_years=round(payback, 1),
-        roi_pct=round(roi, 1), breakeven_occupancy_pct=round(be_occ, 1),
-        implied_value_at_multiple=round(implied_value),
-        max_price_for_target_roi=round(max_price), sensitivity=grid, warnings=warns,
+# ---------------------------------------------------------------------------
+# Streamlit rendering helpers (imported lazily so the module also works headless)
+# ---------------------------------------------------------------------------
+def badge_html(conf: Confidence) -> str:
+    return (
+        f'<span style="background:{conf.colour};color:white;padding:1px 7px;'
+        f'border-radius:10px;font-size:0.70rem;font-weight:600;'
+        f'vertical-align:middle;">{conf.value}</span>'
     )
 
 
-DISCLAIMER = (
-    "These are ESTIMATES from your assumptions only. Verify everything with an "
-    "accountant, broker, lawyer, lease review, payroll records, CCS data, "
-    "room-by-room occupancy reports and full due diligence before any offer."
-)
+def metric_with_source(st, label: str, dp: DataPoint, help_text: str = ""):
+    """Render a labelled value with a confidence badge + a source expander."""
+    st.markdown(
+        f"**{label}**&nbsp;&nbsp;{badge_html(dp.confidence)}<br>"
+        f"<span style='font-size:1.4rem;font-weight:700'>{dp.display()}</span>",
+        unsafe_allow_html=True,
+    )
+    if dp.warning:
+        st.markdown(
+            f"<span style='color:{dp.confidence.colour};font-size:0.78rem'>⚠ {dp.warning}</span>",
+            unsafe_allow_html=True,
+        )
+    with st.expander("source", expanded=False):
+        s = dp.source
+        st.caption(f"**Source:** {s.name}")
+        if s.url:
+            st.caption(f"**Link:** {s.url}")
+        st.caption(f"**Method:** {s.method.value}")
+        st.caption(f"**Retrieved:** {s.retrieved or '—'}")
+        st.caption(f"**Publisher last-updated:** {s.last_updated or 'unknown'}")
+        if help_text:
+            st.caption(help_text)

@@ -1,170 +1,525 @@
 """
-scoring.py
-----------
-The 0-100 "Childcare Acquisition Attractiveness Score".
+West Melbourne Childcare Acquisition Intelligence — Streamlit MVP
+================================================================
+Run:   streamlit run app.py
 
-Each sub-score is 0-100. The weighted blend uses the weights from the
-brief. Crucially, the overall result also reports a DATA-CONFIDENCE level:
-a high score built on DEMO/Missing inputs is explicitly untrustworthy.
+Honest-data design:
+  * Every number carries a source + date + confidence badge.
+  * DEMO values render with a red badge and a banner; they are NOT real.
+  * Real supply data appears the moment you drop the ACECQA register into
+    data/acecqa_services.csv (see README). Same for ABS and schools.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+import os
+import sys
+# Make sure this app's own folder is importable no matter how it's launched
+# (fixes "ModuleNotFoundError: lib" on some hosting setups).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from .provenance import Confidence
+import datetime as dt
 
-WEIGHTS = {
-    "demand": 0.25,
-    "supply_gap": 0.20,
-    "growth": 0.15,
-    "competitor_opportunity": 0.15,
-    "school_family": 0.10,
-    "affordability": 0.10,
-    "planning_risk": 0.05,
-}
+import pandas as pd
+import streamlit as st
 
+from provenance import (DataPoint, Source, Confidence, Method,
+                            metric_with_source, badge_html)
+from demand import assess_demand
+from financial import FinancialInputs, run_model, DISCLAIMER
+from scoring import ScoreInputs, compute_score
+from geo import geocode
+from seed_suburbs import SUBURBS, DEMO_DEMOGRAPHICS, resolve
+from acecqa import get_services
+import datasources as ds
+import analysis
 
-def _band(score: float) -> str:
-    if score >= 85:  return "Strong buy zone"
-    if score >= 70:  return "Attractive — investigate targets"
-    if score >= 55:  return "Possible — needs deeper due diligence"
-    if score >= 40:  return "Risky / competitive"
-    return "Avoid unless special deal"
+try:
+    import plotly.express as px
+    HAVE_PLOTLY = True
+except Exception:
+    HAVE_PLOTLY = False
 
+st.set_page_config(page_title="Childcare Acquisition Intel — West Melbourne",
+                   page_icon="🏫", layout="wide")
 
-@dataclass
-class ScoreInputs:
-    demand_strength: str                  # Low/Medium/High/Very High/Unknown
-    children_per_place: Optional[float]
-    pop_growth_pct: Optional[float]
-    competitor_opportunity_0_100: Optional[float]   # higher = weaker competitors
-    schools_within_3km: Optional[int]
-    median_income: Optional[int]
-    avg_daily_fee: Optional[float]
-    planning_risk: str = "Unknown"        # Low/Medium/High/Unknown
-    data_confidence: Confidence = Confidence.MEDIUM
-
-
-@dataclass
-class ScoreResult:
-    total: int
-    band: str
-    recommendation: str
-    sub_scores: Dict[str, float]
-    reasons: List[str]
-    risks: List[str]
-    data_confidence: Confidence
-    confidence_warning: str
+# --------------------------------------------------------------------------
+# Worst-confidence helper
+# --------------------------------------------------------------------------
+_ORDER = [Confidence.HIGH, Confidence.MEDIUM, Confidence.LOW,
+          Confidence.DEMO, Confidence.MISSING]
+def worst(*cs): return max(cs, key=lambda c: _ORDER.index(c))
 
 
-def _demand_score(s: str) -> float:
-    return {"Very High": 100, "High": 80, "Medium": 55, "Low": 25,
-            "Unknown": 40}.get(s, 40)
+# --------------------------------------------------------------------------
+# Analysis runner (cached per inputs in session_state)
+# --------------------------------------------------------------------------
+def run_analysis(query: str, radius_km: float):
+    key = resolve(query)
+    if key is None:
+        return None
+    name, postcode, lga, sa3, lat, lng = SUBURBS[key]
 
+    # try a live geocode to refine centre; fall back to seed coords
+    geo = geocode(f"{name} {postcode}")
+    used_live_geo = geo is not None
+    if geo:
+        lat, lng = geo
 
-def _supply_gap_score(cpp: Optional[float]) -> float:
-    if cpp is None: return 40
-    if cpp == float("inf"): return 100
-    # more children per place = bigger gap = better
-    if cpp >= 5: return 100
-    if cpp >= 4: return 85
-    if cpp >= 3: return 70
-    if cpp >= 2: return 50
-    if cpp >= 1.2: return 30
-    return 15
+    demo = DEMO_DEMOGRAPHICS.get(key)
+    demog = ds.census_demographics(key, demo, "seed-demo")
 
+    supply = get_services(lat, lng, postcode, radius_km)
+    schools, school_dp = ds.nearby_schools(lat, lng, radius_km)
+    schools_3km = [s for s in schools if s["distance_km"] <= 3]
+    planning = ds.planning_risk(name)
+    listings, listings_dp = ds.business_listings(name)
 
-def _growth_score(g: Optional[float]) -> float:
-    if g is None: return 45
-    if g >= 4: return 100
-    if g >= 3: return 85
-    if g >= 2: return 70
-    if g >= 1: return 55
-    if g >= 0: return 40
-    return 20
+    # demand
+    total_places_dp = (DataPoint(supply.total_places, supply.source, supply.confidence, "places")
+                       if supply.total_places is not None
+                       else DataPoint.missing("Total approved places",
+                                              "Load ACECQA register."))
+    demand = assess_demand(demog["children_0_4"], total_places_dp,
+                           demog["growth_pct"].value)
 
+    # competition
+    qbreak = analysis.quality_breakdown(supply.services)
+    risk_table = analysis.competitor_risk_table(supply.services)
+    targets = analysis.acquisition_targets(supply.services)
+    comp_opp = analysis.competitor_opportunity_score(supply.services)
 
-def _school_score(n: Optional[int]) -> float:
-    if n is None: return 45
-    if n >= 6: return 100
-    if n >= 4: return 80
-    if n >= 2: return 60
-    if n >= 1: return 45
-    return 25
+    # overall data confidence (drives whether the score is trustworthy)
+    data_conf = worst(demog["children_0_4"].confidence, supply.confidence)
 
+    score = compute_score(ScoreInputs(
+        demand_strength=demand.growth_adjusted_strength,
+        children_per_place=demand.children_per_place,
+        pop_growth_pct=demog["growth_pct"].value,
+        competitor_opportunity_0_100=comp_opp,
+        schools_within_3km=len(schools_3km) if school_dp.confidence != Confidence.MISSING else None,
+        median_income=demog["median_income"].value,
+        avg_daily_fee=None,
+        planning_risk="Unknown",
+        data_confidence=data_conf,
+    ))
 
-def _afford_score(income: Optional[int], fee: Optional[float]) -> float:
-    if income is None: return 50
-    # weekly fee burden vs weekly household income
-    if fee is None: 
-        if income >= 110000: return 75
-        if income >= 80000: return 60
-        return 45
-    weekly_income = income / 52.0
-    weekly_fee = fee * 5
-    burden = weekly_fee / weekly_income if weekly_income else 1
-    if burden <= 0.15: return 90
-    if burden <= 0.22: return 70
-    if burden <= 0.30: return 50
-    return 30
-
-
-def _planning_score(risk: str) -> float:
-    return {"Low": 90, "Medium": 60, "High": 25, "Unknown": 55}.get(risk, 55)
-
-
-def _recommendation(total: int, conf: Confidence) -> str:
-    if conf in (Confidence.DEMO, Confidence.MISSING):
-        return "Insufficient real data — load live sources before deciding"
-    if total >= 85:  return "Buy"
-    if total >= 70:  return "Watchlist — investigate acquisition targets"
-    if total >= 55:  return "Watchlist — deeper due diligence required"
-    if total >= 40:  return "Only buy at discount"
-    return "Avoid"
-
-
-def compute_score(inp: ScoreInputs) -> ScoreResult:
-    subs = {
-        "demand": _demand_score(inp.demand_strength),
-        "supply_gap": _supply_gap_score(inp.children_per_place),
-        "growth": _growth_score(inp.pop_growth_pct),
-        "competitor_opportunity": inp.competitor_opportunity_0_100 if inp.competitor_opportunity_0_100 is not None else 50,
-        "school_family": _school_score(inp.schools_within_3km),
-        "affordability": _afford_score(inp.median_income, inp.avg_daily_fee),
-        "planning_risk": _planning_score(inp.planning_risk),
-    }
-    total = round(sum(subs[k] * WEIGHTS[k] for k in WEIGHTS))
-
-    # Build reasons / risks from the strongest and weakest sub-scores
-    ranked = sorted(subs.items(), key=lambda kv: kv[1], reverse=True)
-    label = {
-        "demand": "Demand strength",
-        "supply_gap": "Supply gap (children per place)",
-        "growth": "Population growth",
-        "competitor_opportunity": "Competitor weakness/opportunity",
-        "school_family": "School & family ecosystem",
-        "affordability": "Income/fee affordability",
-        "planning_risk": "Planning/property risk",
-    }
-    reasons = [f"{label[k]} scores {v:.0f}/100" for k, v in ranked[:5] if v >= 55]
-    risks = [f"{label[k]} is weak at {v:.0f}/100" for k, v in ranked[::-1][:5] if v < 60]
-    if not reasons:
-        reasons = ["No strong positive driver — market looks marginal."]
-    if not risks:
-        risks = ["No single dominant risk, but verify all inputs with real data."]
-
-    conf = inp.data_confidence
-    warn = ""
-    if conf in (Confidence.DEMO, Confidence.MISSING):
-        warn = ("⚠ This score is built on DEMO/incomplete inputs. It demonstrates "
-                "the engine only and must NOT be used for a real decision until "
-                "live ACECQA + ABS + schools data are loaded.")
-    elif conf == Confidence.LOW:
-        warn = "Score uses low-confidence (stale/scraped/estimated) inputs — treat as directional."
-
-    return ScoreResult(
-        total=total, band=_band(total),
-        recommendation=_recommendation(total, conf),
-        sub_scores=subs, reasons=reasons[:5], risks=risks[:5],
-        data_confidence=conf, confidence_warning=warn,
+    return dict(
+        key=key, name=name, postcode=postcode, lga=lga, sa3=sa3,
+        lat=lat, lng=lng, used_live_geo=used_live_geo, radius_km=radius_km,
+        demog=demog, supply=supply, total_places_dp=total_places_dp,
+        schools=schools, schools_3km=schools_3km, school_dp=school_dp,
+        planning=planning, listings=listings, listings_dp=listings_dp,
+        demand=demand, qbreak=qbreak, risk_table=risk_table,
+        targets=targets, comp_opp=comp_opp, score=score,
+        ran_at=Source.now(),
     )
+
+
+# --------------------------------------------------------------------------
+# Sidebar nav
+# --------------------------------------------------------------------------
+st.sidebar.title("🏫 Childcare Acquisition Intel")
+st.sidebar.caption("West Melbourne MVP · provenance-first")
+PAGE = st.sidebar.radio("Navigate", [
+    "1 · Suburb Search",
+    "2 · Executive Summary",
+    "3 · Competition Map",
+    "4 · Demand & Demographics",
+    "5 · Schools & Family",
+    "6 · Acquisition Targets",
+    "7 · Financial Model",
+    "8 · Data Sources & Freshness",
+])
+
+if "result" not in st.session_state:
+    st.session_state.result = None
+
+
+def need_result():
+    if not st.session_state.result:
+        st.info("Run an analysis on **Page 1 · Suburb Search** first.")
+        return False
+    return True
+
+
+# ==========================================================================
+# PAGE 1 — SEARCH
+# ==========================================================================
+if PAGE.startswith("1"):
+    st.title("Suburb Search")
+    st.caption("West Melbourne childcare acquisition screening. "
+               "Enter a suburb or postcode and run the analysis.")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        q = st.text_input("Suburb name or postcode",
+                          placeholder="e.g. Tarneit, Werribee, 3029, 3030")
+    with c2:
+        radius = st.selectbox("Radius (km)", [3, 5, 7, 10], index=1)
+
+    st.caption("Seeded suburbs: " + ", ".join(v[0] for v in SUBURBS.values()))
+
+    if st.button("▶ Run analysis", type="primary"):
+        if not q.strip():
+            st.warning("Enter a suburb or postcode.")
+        else:
+            with st.spinner("Resolving location, pulling supply/demand, scoring…"):
+                res = run_analysis(q, float(radius))
+            if res is None:
+                st.error(f"'{q}' not in the seeded west-Melbourne set. "
+                         "Add it to data/seed_suburbs.py.")
+            else:
+                st.session_state.result = res
+                st.success(f"Analysed {res['name']} {res['postcode']} "
+                           f"({res['lga']}). Open Page 2 for the summary.")
+                if res["supply"].confidence == Confidence.MISSING:
+                    st.warning(res["supply"].warning)
+                if res["demog"]["children_0_4"].confidence == Confidence.DEMO:
+                    st.error("⚠ Demographics are DEMO placeholders. Load ABS data "
+                             "before trusting any verdict (see Page 8).")
+
+
+# ==========================================================================
+# PAGE 2 — EXECUTIVE SUMMARY
+# ==========================================================================
+elif PAGE.startswith("2"):
+    st.title("Executive Summary")
+    if need_result():
+        r = st.session_state.result
+        sc = r["score"]
+        st.subheader(f"{r['name']} · {r['postcode']} · {r['lga']}")
+        if sc.confidence_warning:
+            st.error(sc.confidence_warning)
+
+        a, b, c = st.columns([1, 1, 2])
+        a.metric("Acquisition Score", f"{sc.total}/100")
+        b.metric("Band", sc.band.split(" — ")[0])
+        c.metric("Recommendation", sc.recommendation)
+        st.markdown(f"Overall data confidence: {badge_html(sc.data_confidence)}",
+                    unsafe_allow_html=True)
+
+        st.divider()
+        l, rr = st.columns(2)
+        with l:
+            st.markdown("**Top reasons**")
+            for x in sc.reasons: st.markdown(f"- {x}")
+        with rr:
+            st.markdown("**Top risks**")
+            for x in sc.risks: st.markdown(f"- {x}")
+
+        st.divider()
+        st.markdown("**Demand vs supply**")
+        d = r["demand"]
+        k1, k2, k3, k4 = st.columns(4)
+        with k1: metric_with_source(st, "Children 0–4", r["demog"]["children_0_4"])
+        with k2: metric_with_source(st, "Total approved places", r["total_places_dp"])
+        with k3:
+            cpp = d.children_per_place
+            st.metric("Children per place", f"{cpp}" if cpp is not None else "—")
+        with k4:
+            st.metric("Demand (growth-adj.)", d.growth_adjusted_strength)
+
+        st.divider()
+        best = r["targets"][0] if r["targets"] else None
+        st.markdown("**Biggest opportunity**")
+        if best:
+            st.success(f"Top acquisition target: **{best['Centre']}** "
+                       f"(score {best['Target score']}/100) — {best['Why']}")
+        else:
+            st.info("No competitor centres loaded — load the ACECQA register to find targets.")
+        st.markdown("**Biggest risk**")
+        st.warning(sc.risks[0] if sc.risks else "Verify all inputs with real data.")
+
+
+# ==========================================================================
+# PAGE 3 — COMPETITION MAP
+# ==========================================================================
+elif PAGE.startswith("3"):
+    st.title("Childcare Competition Map")
+    if need_result():
+        r = st.session_state.result
+        sv = r["supply"].services
+        if not sv:
+            st.warning(r["supply"].warning or "No services loaded.")
+        else:
+            rows = []
+            for s in sv:
+                if s.lat and s.lng:
+                    rows.append(dict(lat=s.lat, lon=s.lng, name=s.name,
+                                     rating=s.nqs_rating, type=s.service_type,
+                                     provider=s.provider, distance=s.distance_km))
+            # centre point
+            rows.append(dict(lat=r["lat"], lon=r["lng"], name=f"◎ {r['name']} centre",
+                             rating="(catchment centre)", type="", provider="", distance=0))
+            dfm = pd.DataFrame(rows)
+            if HAVE_PLOTLY and dfm["lat"].notna().any():
+                fig = px.scatter_mapbox(
+                    dfm, lat="lat", lon="lon", color="rating",
+                    hover_name="name", hover_data=["type", "provider", "distance"],
+                    zoom=11, height=520)
+                fig.update_layout(mapbox_style="open-street-map",
+                                  margin=dict(l=0, r=0, t=0, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.map(dfm.rename(columns={"lon": "lon"})[["lat", "lon"]])
+                st.caption("Install plotly for coloured rating markers.")
+
+            st.markdown("**All services in radius**")
+            st.dataframe(pd.DataFrame([{
+                "Centre": s.name, "Type": s.service_type, "Provider": s.provider,
+                "Rating": s.nqs_rating, "Status": s.approval_status,
+                "Places": s.places, "Dist km": s.distance_km, "Address": s.address,
+            } for s in sv]), use_container_width=True, hide_index=True)
+
+
+# ==========================================================================
+# PAGE 4 — DEMAND & DEMOGRAPHICS
+# ==========================================================================
+elif PAGE.startswith("4"):
+    st.title("Demand & Demographics")
+    if need_result():
+        r = st.session_state.result
+        dg = r["demog"]
+        if dg["children_0_4"].confidence == Confidence.DEMO:
+            st.error("⚠ All demographics on this page are DEMO placeholders — not real.")
+        cols = st.columns(3)
+        with cols[0]: metric_with_source(st, "Population", dg["population"])
+        with cols[1]: metric_with_source(st, "Children 0–4", dg["children_0_4"])
+        with cols[2]: metric_with_source(st, "Children 5–9", dg["children_5_9"])
+        cols2 = st.columns(3)
+        with cols2[0]: metric_with_source(st, "Median household income", dg["median_income"])
+        with cols2[1]: metric_with_source(st, "Population growth", dg["growth_pct"])
+        with cols2[2]:
+            d = r["demand"]
+            st.markdown(f"**Demand strength** {badge_html(d.confidence)}",
+                        unsafe_allow_html=True)
+            st.markdown(f"<span style='font-size:1.4rem;font-weight:700'>"
+                        f"{d.growth_adjusted_strength}</span>", unsafe_allow_html=True)
+            st.caption(d.notes)
+
+        st.divider()
+        d = r["demand"]
+        m = st.columns(4)
+        m[0].metric("Children per place", d.children_per_place if d.children_per_place else "—")
+        m[1].metric("Places / 100 children", d.places_per_100_children if d.places_per_100_children else "—")
+        m[2].metric("Est. unmet places", d.estimated_unmet_places if d.estimated_unmet_places is not None else "—")
+        m[3].metric("Base demand", d.strength)
+        st.caption("Forecasts: label the forecast version when you wire VIF/.id "
+                   "population projections (see roadmap).")
+
+
+# ==========================================================================
+# PAGE 5 — SCHOOLS & FAMILY
+# ==========================================================================
+elif PAGE.startswith("5"):
+    st.title("Schools & Family Drivers")
+    if need_result():
+        r = st.session_state.result
+        if r["school_dp"].confidence == Confidence.MISSING:
+            st.warning(r["school_dp"].warning)
+        else:
+            within = {km: len([s for s in r["schools"] if s["distance_km"] <= km])
+                      for km in (1, 3, 5)}
+            c = st.columns(3)
+            c[0].metric("Schools ≤1 km", within[1])
+            c[1].metric("Schools ≤3 km", within[3])
+            c[2].metric("Schools ≤5 km", within[5])
+            st.dataframe(pd.DataFrame([{
+                "School": s["name"], "Type": s["type"], "Dist km": s["distance_km"],
+            } for s in r["schools"]]), use_container_width=True, hide_index=True)
+
+
+# ==========================================================================
+# PAGE 6 — ACQUISITION TARGETS
+# ==========================================================================
+elif PAGE.startswith("6"):
+    st.title("Acquisition Targets")
+    if need_result():
+        r = st.session_state.result
+        st.markdown("**Possible target ranking** (existing centres scored for buy-appeal)")
+        if r["targets"]:
+            st.dataframe(pd.DataFrame(r["targets"]), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No centres loaded — load the ACECQA register (Page 8 / README).")
+
+        st.divider()
+        st.markdown("**Competitor risk table**")
+        if r["risk_table"]:
+            st.dataframe(pd.DataFrame(r["risk_table"]), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("**Businesses for sale**")
+        st.info(r["listings_dp"].warning)
+
+        st.divider()
+        st.markdown("**Due-diligence checklist**")
+        for item in [
+            "Request last 3 years financials", "Verify occupancy by room and age group",
+            "Check CCS income", "Check wage percentage",
+            "Check lease terms and rent increases", "Check staff qualifications and retention",
+            "Check NQS rating and compliance history", "Check enrolment pipeline",
+            "Check waiting list", "Check local competition",
+            "Check maintenance / capex needs", "Check council / planning restrictions",
+            "Get accountant and lawyer review",
+        ]:
+            st.checkbox(item, key=f"dd_{item}")
+
+
+# ==========================================================================
+# PAGE 7 — FINANCIAL MODEL
+# ==========================================================================
+elif PAGE.startswith("7"):
+    st.title("Financial Opportunity Model")
+    st.caption("Real maths on YOUR assumptions. No external data is used here.")
+    with st.form("fin"):
+        c = st.columns(4)
+        places = c[0].number_input("Licensed places", 10, 300, 90)
+        occ = c[1].number_input("Occupancy %", 10.0, 100.0, 85.0)
+        fee = c[2].number_input("Avg daily fee $", 50.0, 250.0, 145.0)
+        days = c[3].number_input("Days open / yr", 200, 365, 250)
+        c = st.columns(4)
+        wage = c[0].number_input("Wage % of rev", 0.0, 100.0, 55.0)
+        rent = c[1].number_input("Rent %", 0.0, 50.0, 12.0)
+        food = c[2].number_input("Food %", 0.0, 20.0, 4.0)
+        other = c[3].number_input("Other %", 0.0, 40.0, 9.0)
+        c = st.columns(4)
+        price = c[0].number_input("Purchase price $", 0.0, 50_000_000.0, 3_000_000.0, step=50000.0)
+        mult = c[1].number_input("EBITDA multiple", 0.0, 15.0, 5.0)
+        loan = c[2].number_input("Loan amount $", 0.0, 50_000_000.0, 2_000_000.0, step=50000.0)
+        rate = c[3].number_input("Interest %", 0.0, 20.0, 7.0)
+        target_roi = st.number_input("Target ROI % (for max-price calc)", 0.0, 100.0, 20.0)
+        go = st.form_submit_button("Calculate", type="primary")
+
+    if go:
+        res = run_model(FinancialInputs(places, occ, fee, days, wage, rent, food,
+                                        other, price, mult, loan, rate, target_roi))
+        m = st.columns(4)
+        m[0].metric("Revenue (at your occ.)", f"${res.revenue:,.0f}")
+        m[1].metric("EBITDA", f"${res.ebitda:,.0f}", f"{res.ebitda_margin_pct}% margin")
+        m[2].metric("Net profit (post-interest)", f"${res.net_profit:,.0f}")
+        m[3].metric("ROI on equity", f"{res.roi_pct}%")
+        m = st.columns(4)
+        m[0].metric("Payback", f"{res.payback_years} yrs")
+        m[1].metric("Break-even occupancy", f"{res.breakeven_occupancy_pct}%")
+        m[2].metric("Implied value @ multiple", f"${res.implied_value_at_multiple:,.0f}")
+        m[3].metric("Max price @ target ROI", f"${res.max_price_for_target_roi:,.0f}")
+
+        st.markdown("**Revenue by occupancy scenario**")
+        st.dataframe(pd.DataFrame([{"Occupancy %": k, "Revenue $": f"{v:,.0f}"}
+                                   for k, v in res.revenue_scenarios.items()]),
+                     hide_index=True, use_container_width=True)
+        st.markdown("**Sensitivity — EBITDA by occupancy × daily fee**")
+        st.dataframe(pd.DataFrame(res.sensitivity), hide_index=True, use_container_width=True)
+        for w in res.warnings:
+            st.warning(w)
+        st.error(DISCLAIMER)
+
+
+# ==========================================================================
+# PAGE 8 — DATA SOURCES & FRESHNESS
+# ==========================================================================
+elif PAGE.startswith("8"):
+    st.title("Data Sources & Freshness")
+    st.caption("Every source, its method, confidence and how to make it real.")
+    if not st.session_state.result:
+        st.info("Run an analysis to populate live freshness timestamps.")
+    rows = [
+        ["ACECQA National Registers (supply, NQS, type, provider)",
+         "https://www.acecqa.gov.au/resources/national-registers",
+         "download / file-drop", "High when loaded",
+         "Drop export to data/acecqa_services.csv, or set ACECQA_REGISTER_URL"],
+        ["StartingBlocks (fees/vacancy supplement)",
+         "https://www.startingblocks.gov.au", "manual/scrape", "Low–Medium",
+         "Use to fill fees & vacancy; label LOW if scraped"],
+        ["ABS Census 2021 (demographics)",
+         "https://www.abs.gov.au/census", "download / API", "High when loaded",
+         "Drop DataPack to data/abs_<suburb>.csv; 2021 is latest Census"],
+        ["DataVic — Victorian School Locations",
+         "https://discover.data.vic.gov.au", "download", "High when loaded",
+         "Drop CSV to data/vic_schools.csv"],
+        ["VicPlan / Vicmap Planning (zoning, overlays)",
+         "https://mapshare.vic.gov.au/vicplan/", "manual / WFS", "Manual",
+         "Check per-address; wire WFS for automation"],
+        ["Business-for-sale listings",
+         "(various marketplaces)", "manual / scrape", "Low",
+         "Disabled by default — respect site Terms of Use"],
+        ["OSM Nominatim (geocoding)",
+         "https://nominatim.openstreetmap.org", "api", "Medium",
+         "Free, rate-limited; falls back to seed coords"],
+    ]
+    st.dataframe(pd.DataFrame(rows, columns=[
+        "Source", "Link", "Method", "Confidence", "How to make it real / fresh"]),
+        use_container_width=True, hide_index=True)
+
+    if st.session_state.result:
+        r = st.session_state.result
+        st.divider()
+        st.markdown(f"**This report**")
+        st.caption(f"Run at: {r['ran_at']}")
+        st.caption(f"Geocode: {'live OSM' if r['used_live_geo'] else 'seed fallback coords'}")
+        st.caption(f"Supply confidence: {r['supply'].confidence.value} — {r['supply'].warning or 'ok'}")
+        st.caption(f"Demographics confidence: {r['demog']['children_0_4'].confidence.value}")
+        st.markdown("**Freshness rules enforced:** ACECQA cache ≤24h / refresh on search · "
+                    "schools monthly · ABS labelled by Census year · listings on-demand · "
+                    "planning weekly/on-demand. Blocked sources show a warning and never invent data.")
+
+    # --- LIVE ABS Data API control panel ---------------------------------
+    st.divider()
+    st.subheader("🔌 Live ABS Data API — connect real demographics")
+    st.caption("Run discovery once to confirm the dataflow IDs and ASGS region "
+               "codes (these can't be hardcoded safely), then save them. After "
+               "that, demographics load live with High confidence.")
+
+    import abs_api
+    cfg = abs_api.load_config()
+    st.caption(f"Current saved config: `{abs_api.CONFIG_PATH}` — "
+               f"{len(cfg.get('suburbs', {}))} suburb(s) configured.")
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Run ABS connectivity diagnose"):
+            with st.spinner("Contacting data.api.abs.gov.au…"):
+                st.json(abs_api.diagnose())
+    with colB:
+        flow_filter = st.text_input("Discover dataflows containing", "C21")
+        if st.button("List matching dataflows"):
+            with st.spinner("Fetching dataflow registry…"):
+                st.json(abs_api.discover_dataflows(flow_filter))
+
+    st.markdown("**Resolve a suburb to an ASGS region code**")
+    rc = st.columns([2, 2, 1])
+    region_name = rc[0].text_input("Suburb / area name", "Tarneit")
+    codelist = rc[1].text_input("Codelist", "CL_ASGS_2021_SA2")
+    if rc[2].button("Resolve"):
+        with st.spinner("Searching codelist…"):
+            st.json(abs_api.resolve_region(region_name, codelist))
+
+    with st.expander("Save a verified ABS config for a suburb"):
+        st.caption("Paste the confirmed IDs/codes from discovery above. Leave "
+                   "the datakey fields as the SDMX key the ABS Data Explorer "
+                   "shows for your region+table. Saved to abs_config.json.")
+        sk = st.selectbox("Suburb key", list(SUBURBS.keys()))
+        region_code = st.text_input("region_code (ASGS)", "")
+        region_type = st.text_input("region_type", "SA2")
+        pop_flow = st.text_input("pop_flow (age table dataflow id)", "")
+        datakey_pop = st.text_input("datakey_pop (SDMX key)", "")
+        age_dim = st.text_input("age_dim id", "AGE")
+        age_0_4 = st.text_input("age codes 0-4 (comma sep)", "A0_4")
+        age_5_9 = st.text_input("age codes 5-9 (comma sep)", "A5_9")
+        age_total = st.text_input("age codes total (comma sep)", "TOT")
+        income_flow = st.text_input("income_flow id", "")
+        datakey_income = st.text_input("datakey_income (SDMX key)", "")
+        if st.button("💾 Save ABS config"):
+            cfg.setdefault("suburbs", {})[sk] = {
+                "region_code": region_code.strip(), "region_type": region_type.strip(),
+                "pop_flow": pop_flow.strip(), "datakey_pop": datakey_pop.strip(),
+                "age_dim": age_dim.strip(),
+                "age_codes": {
+                    "0_4": [c.strip() for c in age_0_4.split(",") if c.strip()],
+                    "5_9": [c.strip() for c in age_5_9.split(",") if c.strip()],
+                    "total": [c.strip() for c in age_total.split(",") if c.strip()],
+                },
+                "income_flow": income_flow.strip(),
+                "datakey_income": datakey_income.strip(),
+            }
+            abs_api.save_config(cfg)
+            st.success(f"Saved config for {sk}. Re-run the search on Page 1 — "
+                       "demographics will now load live from the ABS API.")

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .provenance import DataPoint, Source, Confidence, Method
+from provenance import DataPoint, Source, Confidence, Method
 
 
 @dataclass

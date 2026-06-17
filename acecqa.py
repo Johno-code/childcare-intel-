@@ -25,10 +25,10 @@ from typing import List, Optional
 
 import pandas as pd
 
-from lib.provenance import Source, Confidence, Method
-from lib.geo import haversine_km
+from provenance import Source, Confidence, Method
+from geo import haversine_km
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_CSV = os.path.join(DATA_DIR, "acecqa_services.csv")
 LOCAL_XLSX = os.path.join(DATA_DIR, "acecqa_services.xlsx")
 
